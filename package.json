@@ -1,0 +1,38 @@
+{
+  "name": "crossword-scanner",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "android:prepare": "node scripts/build-web.js && cap sync android",
+    "android:open": "cap open android",
+    "android:add": "node scripts/build-web.js && cap add android"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.3.1",
+    "electron": "^41.3.0",
+    "electron-builder": "^26.8.1"
+  },
+  "dependencies": {
+    "@capacitor/android": "^6.1.2",
+    "@capacitor/core": "^6.1.2"
+  },
+  "description": "",
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "build": {
+    "appId": "com.example.crosswordscanner",
+    "productName": "Kreuzwort",
+    "files": [
+      "main.js",
+      "index.html",
+      "sw.js",
+      "manifest.json",
+      "libs/**/*",
+      "package.json"
+    ]
+  }
+}

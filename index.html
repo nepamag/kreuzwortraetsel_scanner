@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kreuzworträtsel Scanner</title>
+
+<script src="libs/tesseract.min.js"></script>
+<script src="libs/opencv.js"></script>
+
+<style>
+body { font-family: sans-serif; background:#16537e; color:#fff; text-align:center; padding:20px; }
+button { padding:10px 20px; margin-top:10px; }
+canvas,img { max-width:100%; margin-top:10px; }
+</style>
+</head>
+
+<body>
+<h2>📷 Kreuzworträtsel Scanner</h2>
+
+<!-- Hidden inputs: one opens the file/gallery picker, the other opens the camera.
+     `capture="environment"` is the back-camera hint; ignored on desktop. -->
+<input type="file" id="filePick" accept="image/*" style="display:none">
+<input type="file" id="fileCam"  accept="image/*" capture="environment" style="display:none">
+
+<button onclick="document.getElementById('filePick').click()">Bild auswählen</button>
+<button onclick="document.getElementById('fileCam').click()">Foto aufnehmen</button>
+<br>
+<img id="preview" style="display:none" alt="" />
+<br>
+<button onclick="rotateMore()">Drehen ↻</button>
+<button onclick="processImage()">Scan</button>
+<span id="rotationLabel" style="margin-left:10px"></span>
+<br>
+<!-- Debug view: shows the actual grayscale image Tesseract sees, so you can
+     verify text is sharp and readable. If this looks blurry, retake the photo. -->
+<canvas id="debugCanvas" style="max-width:100%; display:none; border:1px solid #444; margin-top:10px"></canvas>
+
+<p id="status"></p>
+<pre id="output"></pre>
+
+<div>
+  <button onclick="setMode('waagrecht')">Waagrecht</button>
+  <button onclick="setMode('senkrecht')">Senkrecht</button>
+</div>
+
+<br>
+
+<input id="numberInput" type="number" placeholder="Enter number">
+<button onclick="lookup()">Lösung</button>
+
+<p id="result"></p>
+<p id="modeStatus"></p>
+
+
+<script>
+// Service worker handling.
+// - Only register on http(s): SWs aren't useful on file:// (e.g. Electron),
+//   because all files are already local. Registering one there can also
+//   intercept fetches and break the app.
+// - On file:// origins, actively unregister any leftover SW from a previous
+//   http session so it doesn't keep serving stale "Offline" responses.
+if ('serviceWorker' in navigator) {
+  const isHttp = location.protocol === 'http:' || location.protocol === 'https:';
+  window.addEventListener('load', async () => {
+    try {
+      if (isHttp) {
+        const reg = await navigator.serviceWorker.register('sw.js');
+        console.log('Service worker registered:', reg.scope);
+      } else {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        let removed = false;
+        for (const reg of regs) {
+          await reg.unregister();
+          console.log('Unregistered stale service worker:', reg.scope);
+          removed = true;
+        }
+        if ('caches' in window) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map(k => caches.delete(k)));
+          if (keys.length) {
+            console.log('Cleared SW caches:', keys);
+            removed = true;
+          }
+        }
+        // If a stale SW was controlling this page, reload once so the next
+        // load is uncontrolled and assets load straight from disk.
+        if (removed && navigator.serviceWorker.controller && !sessionStorage.getItem('swCleaned')) {
+          sessionStorage.setItem('swCleaned', '1');
+          location.reload();
+        }
+      }
+    } catch (err) {
+      console.warn('Service worker setup failed:', err);
+    }
+  });
+}
+
+let imgEl = document.getElementById('preview');
+let parsedData = {};
+let mode = "waagrecht";
+let userRotation = 0;  // 0 / 90 / 180 / 270 — applied before OCR
+
+function rotateMore() {
+  userRotation = (userRotation + 90) % 360;
+  document.getElementById('rotationLabel').innerText = `Drehung: ${userRotation}°`;
+}
+
+// Same handler for both inputs — gallery pick and camera capture.
+//
+// Use URL.createObjectURL rather than FileReader.readAsDataURL: data URLs
+// base64-encode the whole file into imgEl.src as a single huge string, which
+// can silently truncate for ~10MB+ camera photos and result in a tiny
+// fragment being decoded (e.g. 2x36 px → "Image too small to scale").
+// Object URLs are lightweight references that the browser streams from disk.
+function handleFileSelected(e) {
+  const file = e.target.files && e.target.files[0];
+  const statusEl = document.getElementById('status');
+  if (!file) return;
+  statusEl.innerText = 'Lade Bild...';
+
+  // Free the previous object URL so we don't leak memory on repeated picks.
+  if (imgEl.src && imgEl.src.startsWith('blob:')) {
+    URL.revokeObjectURL(imgEl.src);
+  }
+
+  imgEl.onload = () => {
+    const kb = (file.size / 1024).toFixed(0);
+    statusEl.innerText = `Bild geladen: ${file.name} (${imgEl.naturalWidth}×${imgEl.naturalHeight}, ${kb} KB)`;
+  };
+  imgEl.onerror = () => { statusEl.innerText = 'Bild konnte nicht angezeigt werden.'; };
+  imgEl.src = URL.createObjectURL(file);
+}
+document.getElementById('filePick').onchange = handleFileSelected;
+document.getElementById('fileCam').onchange  = handleFileSelected;
+
+// ---------------- OCR CLEANUP ----------------
+function cleanOCRText(text){
+  return text
+    .replace(/\bI\b/g,'1')
+    .replace(/\bi\b/g,'1')
+    .replace(/\bı\b/g,'1');
+}
+
+// ---------------- PARSER ----------------
+function parse(text){
+	let result ={waagrecht:{},senkrecht:{}};
+    let mode = null;
+    let currentNumber = null;
+
+    // Split while keeping numbers as tokens
+    const tokens = text.split(/(\d+)/);
+
+    for (let i = 0; i < tokens.length; i++) {
+        let token = tokens[i].trim();
+
+        // Detect section switches
+        if (token.includes("WAAGRECHT")) {
+            mode = "waagrecht";
+            continue;
+        }
+        if (token.includes("SENKRECHT")) {
+            mode = "senkrecht";
+            continue;
+        }
+
+        // If token is a number → start new entry
+        if (/^\d+$/.test(token)) {
+            currentNumber = parseInt(token, 10);
+
+            if (mode) {
+                result[mode][currentNumber] = "";
+            }
+            continue;
+        }
+
+        // Otherwise append to current clue
+        if (currentNumber !== null && mode) {
+            // Stop if we accidentally hit another section header
+            if (token.includes("WAAGRECHT") || token.includes("SENKRECHT")) {
+                continue;
+            }
+
+            // Append text
+            result[mode][currentNumber] += (result[mode][currentNumber] ? " " : "") + token;
+        }
+    }
+
+    // Clean + filter short entries
+    for (const section of ["waagrecht", "senkrecht"]) {
+        for (const key in result[section]) {
+            let value = result[section][key]
+                .replace(/\s+/g, " ")
+                .trim()
+                .replace(/^[:.\-–—]+/, "")
+                .trim();
+
+            // 🔥 filter rule: keep only if longer than 2 characters
+            if (value.length > 2) {
+                result[section][key] = value;
+            } else {
+                delete result[section][key];
+            }
+        }
+    }
+
+    return result;
+}
+
+// ---------------- DESKEW ----------------
+function deskew(canvas){
+  let src=cv.imread(canvas);
+  let gray=new cv.Mat();
+  let edges=new cv.Mat();
+
+  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+  cv.Canny(gray,edges,50,150);
+
+  let lines=new cv.Mat();
+  cv.HoughLines(edges,lines,1,Math.PI/180,150);
+
+  let angle=0,count=0;
+
+  for(let i=0;i<lines.rows;i++){
+    let theta=lines.data32F[i*2+1];
+    let deg=(theta*180/Math.PI)-90;
+
+    if(deg>-45 && deg<45){
+      angle+=deg;
+      count++;
+    }
+  }
+
+  angle = count ? angle/count : 0;
+
+  let center=new cv.Point(src.cols/2,src.rows/2);
+  let rot=cv.getRotationMatrix2D(center,angle,1);
+
+  let dst=new cv.Mat();
+  cv.warpAffine(src,dst,rot,new cv.Size(src.cols,src.rows));
+
+  let out=document.createElement('canvas');
+  cv.imshow(out,dst);
+
+  src.delete(); gray.delete(); edges.delete(); lines.delete(); dst.delete();
+
+  return out;
+}
+
+// ---------------- ROTATION ----------------
+function rotateCanvas(canvas, angle) {
+  const rad = angle * Math.PI / 180;
+
+  const newCanvas = document.createElement('canvas');
+  const ctx = newCanvas.getContext('2d');
+
+  if (angle === 90 || angle === 270) {
+    newCanvas.width = canvas.height;
+    newCanvas.height = canvas.width;
+  } else {
+    newCanvas.width = canvas.width;
+    newCanvas.height = canvas.height;
+  }
+
+  ctx.translate(newCanvas.width / 2, newCanvas.height / 2);
+  ctx.rotate(rad);
+  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+
+  return newCanvas;
+}
+
+// ---------------- SCORING ----------------
+function scoreText(text) {
+  let score = 0;
+
+  if (/waagrecht/i.test(text)) score += 10;
+  if (/senkrecht/i.test(text)) score += 10;
+
+  // Number + 3+ letter uppercase word — strong "clue header" signal.
+  const clueMatches = text.match(/\d+\s+[A-ZÄÖÜ]{3,}/g);
+  if (clueMatches) score += clueMatches.length;
+
+  // Generic: any 3+ letter alphabetic word. Small weight, but ensures
+  // a rotation that produced *some* readable text still beats one that
+  // produced complete gibberish or empty output.
+  const words = text.match(/[A-Za-zÄÖÜäöüß]{3,}/g);
+  if (words) score += words.length * 0.1;
+
+  return score;
+}
+
+// ---------------- BEST ORIENTATION ----------------
+async function recognizeBestOrientation(canvas, worker) {
+  const angles = [0, 90, 180, 270];
+  let bestText = '';
+  let bestScore = -1;       // start at -1 so any rotation, even score 0, wins
+  let longestText = '';
+
+  for (let angle of angles) {
+    const rotated = rotateCanvas(canvas, angle);
+    const { data: { text } } = await worker.recognize(rotated);
+
+    const score = scoreText(text);
+    const preview = (text || '').slice(0, 100).replace(/\s+/g, ' ');
+    console.log(`Angle ${angle}: score=${score.toFixed(1)}, len=${(text || '').length}, preview="${preview}"`);
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestText = text;
+    }
+    if ((text || '').length > longestText.length) longestText = text;
+  }
+
+  // Safety net: if every rotation scored 0 but Tesseract did produce some
+  // text, prefer the longest result over an empty bestText.
+  if (bestScore <= 0 && longestText) {
+    console.log('All rotations scored 0; falling back to longest text.');
+    return longestText;
+  }
+  return bestText;
+}
+
+// ---------------- WORKER FACTORY ----------------
+// Tesseract.js v5: language is passed as the first arg to createWorker.
+// We do NOT pass a `logger` function, because some bundles try to clone it
+// across postMessage and throw DataCloneError. Status updates happen in the
+// caller instead.
+//
+// All wasm core files and language data ship inside the package — no network
+// access is required at runtime. This is intentional for Play Store / privacy:
+// the app declares no INTERNET permission and contacts no servers.
+async function makeWorker() {
+  const w = await Tesseract.createWorker('deu', 1, {
+    workerPath: 'libs/worker.min.js',
+    corePath: 'libs/',
+    langPath: 'libs/lang-data',
+    // We ship the uncompressed .traineddata file. Default is gzip:true,
+    // which would make Tesseract fetch deu.traineddata.gz and 404.
+    gzip: false
+  });
+  console.log('Tesseract worker created (local libs/ only).');
+  return w;
+}
+
+// ---------------- MAIN ----------------
+async function processImage(){
+  const statusEl = document.getElementById('status');
+  statusEl.innerText = 'Processing...';
+
+  let worker = null;
+  try {
+    if (!imgEl || !imgEl.naturalWidth) {
+      throw new Error('No image loaded. Pick an image first.');
+    }
+    if (typeof Tesseract === 'undefined') {
+      throw new Error('Tesseract failed to load (libs/tesseract.min.js).');
+    }
+    if (typeof cv === 'undefined' || !cv.imread) {
+      throw new Error('OpenCV not ready yet. Wait a few seconds and retry.');
+    }
+
+    // Cap canvas size. 2000 was too aggressive — characters end up at the
+    // lower edge of Tesseract's reliable size range (~15px) and recognition
+    // collapses into reading paper texture. 3000 keeps characters at ~25–35px.
+    const TARGET_LONG_SIDE = 3000;
+    const longest = Math.max(imgEl.naturalWidth, imgEl.naturalHeight);
+    const scale = Math.min(2, TARGET_LONG_SIDE / longest);
+
+    console.log('[processImage] imgEl natural:', imgEl.naturalWidth, 'x', imgEl.naturalHeight,
+                ' complete=', imgEl.complete, ' src starts:', (imgEl.src || '').slice(0, 64));
+
+    if (imgEl.naturalWidth < 50 || imgEl.naturalHeight < 50) {
+      throw new Error(`Bild zu klein oder nicht geladen (${imgEl.naturalWidth}×${imgEl.naturalHeight}). Bitte erneut auswählen.`);
+    }
+
+    let canvas = document.createElement('canvas');
+    let ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const drawW = Math.max(1, Math.round(imgEl.naturalWidth  * scale));
+    const drawH = Math.max(1, Math.round(imgEl.naturalHeight * scale));
+
+    // Apply userRotation while drawing (90/270 swap dimensions).
+    if (userRotation === 90 || userRotation === 270) {
+      canvas.width  = drawH;
+      canvas.height = drawW;
+    } else {
+      canvas.width  = drawW;
+      canvas.height = drawH;
+    }
+    ctx.imageSmoothingEnabled = false;
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(userRotation * Math.PI / 180);
+    ctx.drawImage(imgEl, -drawW / 2, -drawH / 2, drawW, drawH);
+    ctx.setTransform(1, 0, 0, 1, 0, 0); // reset for subsequent putImageData
+    console.log('[processImage] canvas:', canvas.width, 'x', canvas.height,
+                ' scale=', scale, ' rotation=', userRotation);
+
+    // Preprocessing pipeline:
+    //   1) Convert to grayscale (Tesseract does its own binarization).
+    //   2) Build a luminance histogram in the same pass.
+    //   3) Compute a 1st/99th percentile range and stretch to full 0–255.
+    //      This rescues underexposed photos and tightens contrast.
+    //   4) If the image is mostly dark (mean < 128), invert it.
+    //      Handles dark-mode screenshots and white-on-black content.
+    let img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    let d = img.data;
+    const totalPx = (d.length / 4) | 0;
+
+    // Step 1+2: grayscale into d, build histogram, accumulate sum.
+    const hist = new Uint32Array(256);
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      const g = (0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2]) | 0;
+      d[i] = d[i+1] = d[i+2] = g;
+      hist[g]++;
+      sum += g;
+    }
+    const mean = sum / totalPx;
+
+    // Step 3: find 1% and 99% cutoffs.
+    const lowCount = totalPx * 0.01;
+    const highCount = totalPx * 0.99;
+    let acc = 0, lo = 0, hi = 255;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= lowCount)  { lo = v; break; } }
+    acc = 0;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= highCount) { hi = v; break; } }
+    const range = Math.max(1, hi - lo);
+
+    const invert = mean < 128;
+    console.log('[preprocess] mean=' + mean.toFixed(1)
+              + ' lo=' + lo + ' hi=' + hi
+              + ' invert=' + invert);
+
+    // Step 4: stretch + (conditionally) invert.
+    for (let i = 0; i < d.length; i += 4) {
+      let v = (d[i] - lo) * 255 / range;
+      if (v < 0) v = 0; else if (v > 255) v = 255;
+      if (invert) v = 255 - v;
+      d[i] = d[i+1] = d[i+2] = v;
+    }
+    ctx.putImageData(img, 0, 0);
+
+    // Briefly flash the preprocessed canvas so the user can verify orientation
+    // (is the text horizontal?) but not actually read the content. Heavy blur
+    // hides individual letters; layout and text direction stay obvious.
+    const debugCanvas = document.getElementById('debugCanvas');
+    debugCanvas.width = canvas.width;
+    debugCanvas.height = canvas.height;
+    debugCanvas.getContext('2d').drawImage(canvas, 0, 0);
+    debugCanvas.style.filter = 'blur(6px)';
+    debugCanvas.style.display = 'block';
+    setTimeout(() => { debugCanvas.style.display = 'none'; }, 1200);
+
+    // Skip our HoughLines-based deskew — it can introduce subpixel
+    // interpolation that smears character edges, and Tesseract has its
+    // own internal deskewing.
+    let processed = canvas;
+
+    // OCR
+    statusEl.innerText = 'Loading OCR engine...';
+    worker = await makeWorker();
+
+    // PSM 6 = treat the image as a single uniform block of text. Better
+    // for dense paragraphs of clue text than the default PSM 3 (auto),
+    // which can split the page into bogus sub-regions.
+    if (worker.setParameters) {
+      try { await worker.setParameters({ tessedit_pageseg_mode: '6' }); }
+      catch (e) { console.warn('setParameters failed:', e); }
+    }
+
+    statusEl.innerText = 'Recognizing... (this may take a while)';
+    // We honor the user's manual rotation now, so a single recognize pass
+    // is enough — no need to try four orientations.
+    const result = await worker.recognize(processed);
+    const text = result.data.text;
+    console.log('OCR len=', text.length, ' preview="' + text.slice(0, 200).replace(/\s+/g,' ') + '"');
+
+    console.log("BEST OCR:", text);
+
+    let cleaned = cleanOCRText(text);
+    let parsed = parse(cleaned);
+    parsedData = parsed;
+
+    document.getElementById("preview").style.display = "none";
+    setMode("waagrecht");
+
+    statusEl.innerText = 'Done';
+  } catch (err) {
+    console.error('processImage failed:', err);
+    statusEl.innerText = 'Error: ' + (err && err.message ? err.message : String(err));
+  } finally {
+    if (worker) {
+      try { await worker.terminate(); } catch (_) {}
+    }
+  }
+}
+
+function lookup() {
+    const num = document.getElementById("numberInput").value;
+    const resultBox = document.getElementById("result");
+
+    if (!num) {
+        resultBox.innerText = "Please enter a number.";
+        return;
+    }
+
+    const clue = parsedData?.[mode]?.[num];
+
+    if (clue) {
+        resultBox.innerText = clue;
+    } else {
+        resultBox.innerText = "Not found.";
+    }
+}
+
+
+function setMode(m) {
+	mode = m;
+	document.getElementById("modeStatus").innerText =
+		"Mode: " + (mode === "waagrecht" ? "Horizontal" : "Vertical");
+}
+
+
+</script>
+</body>
+</html>

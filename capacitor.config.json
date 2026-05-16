@@ -1,0 +1,11 @@
+{
+  "appId": "com.example.crosswordscanner",
+  "appName": "Kreuzwort",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
